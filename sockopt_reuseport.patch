@@ -1,0 +1,512 @@
+--- stblinux-2.6.18/include/asm-mips/socket.h	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/include/asm-mips/socket.h	2014-04-15 17:03:09.518674000 +0530
+@@ -31,6 +31,7 @@
+ #if 0
+ To add: #define SO_REUSEPORT 0x0200	/* Allow local address and port reuse.  */
+ #endif
++#define SO_REUSEPORT 0x0200 /* Allow local address and port reuse. */
+ 
+ #define SO_TYPE		0x1008	/* Compatible name for SO_STYLE.  */
+ #define SO_STYLE	SO_TYPE	/* Synonym */
+--- stblinux-2.6.18/include/linux/random.h	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/include/linux/random.h	2014-04-15 17:02:49.833450000 +0530
+@@ -71,4 +71,8 @@
+ 
+ #endif /* __KERNEL___ */
+ 
++static inline u32 next_pseudo_random32(u32 seed)
++{
++   return seed * 1664525 + 1013904223;
++}
+ #endif /* _LINUX_RANDOM_H */
+--- stblinux-2.6.18/include/net/sock.h	2010-01-16 05:23:01.000000000 +0530
++++ Linux_Kernel/include/net/sock.h	2014-04-15 17:02:12.851438000 +0530
+@@ -111,7 +111,8 @@
+ struct sock_common {
+ 	unsigned short		skc_family;
+ 	volatile unsigned char	skc_state;
+-	unsigned char		skc_reuse;
++	unsigned char		skc_reuse:4;
++   unsigned char     skc_reuseport:4;
+ 	int			skc_bound_dev_if;
+ 	struct hlist_node	skc_node;
+ 	struct hlist_node	skc_bind_node;
+@@ -188,6 +189,7 @@
+ #define sk_family		__sk_common.skc_family
+ #define sk_state		__sk_common.skc_state
+ #define sk_reuse		__sk_common.skc_reuse
++#define sk_reuseport __sk_common.skc_reuseport
+ #define sk_bound_dev_if		__sk_common.skc_bound_dev_if
+ #define sk_node			__sk_common.skc_node
+ #define sk_bind_node		__sk_common.skc_bind_node
+--- stblinux-2.6.18/include/net/inet_hashtables.h	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/include/net/inet_hashtables.h	2014-04-15 17:02:37.767941000 +0530
+@@ -75,7 +75,9 @@
+  */
+ struct inet_bind_bucket {
+ 	unsigned short		port;
+-	signed short		fastreuse;
++   signed char fastreuse;
++   signed char fastreuseport;
++   uid_t fastuid;
+ 	struct hlist_node	node;
+ 	struct hlist_head	owners;
+ };
+@@ -272,6 +274,8 @@
+ }
+ 
+ extern struct sock *__inet_lookup_listener(const struct hlist_head *head,
++                  const u32 saddr,
++                  const u16 sport,
+ 					   const u32 daddr,
+ 					   const unsigned short hnum,
+ 					   const int dif);
+@@ -279,6 +283,8 @@
+ /* Optimize the common listener case. */
+ static inline struct sock *
+ 		inet_lookup_listener(struct inet_hashinfo *hashinfo,
++                 const u32 saddr,
++                 const u16 sport,
+ 				     const u32 daddr,
+ 				     const unsigned short hnum, const int dif)
+ {
+@@ -295,7 +301,7 @@
+ 		    (sk->sk_family == PF_INET || !ipv6_only_sock(sk)) &&
+ 		    !sk->sk_bound_dev_if)
+ 			goto sherry_cache;
+-		sk = __inet_lookup_listener(head, daddr, hnum, dif);
++		sk = __inet_lookup_listener(head, saddr, sport, daddr, hnum, dif);
+ 	}
+ 	if (sk) {
+ sherry_cache:
+@@ -398,7 +404,7 @@
+ {
+ 	struct sock *sk = __inet_lookup_established(hashinfo, saddr, sport, daddr,
+ 						    hnum, dif);
+-	return sk ? : inet_lookup_listener(hashinfo, daddr, hnum, dif);
++	return sk ? : inet_lookup_listener(hashinfo, saddr, sport, daddr, hnum, dif);
+ }
+ 
+ static inline struct sock *inet_lookup(struct inet_hashinfo *hashinfo,
+--- stblinux-2.6.18/include/net/inet6_hashtables.h	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/include/net/inet6_hashtables.h	2014-04-15 17:02:23.230370000 +0530
+@@ -63,6 +63,8 @@
+ 					   const int dif);
+ 
+ extern struct sock *inet6_lookup_listener(struct inet_hashinfo *hashinfo,
++                 const struct in6_addr *saddr,
++                 const u16 sport,
+ 					  const struct in6_addr *daddr,
+ 					  const unsigned short hnum,
+ 					  const int dif);
+@@ -79,7 +81,7 @@
+ 	if (sk)
+ 		return sk;
+ 
+-	return inet6_lookup_listener(hashinfo, daddr, hnum, dif);
++	return inet6_lookup_listener(hashinfo, saddr, sport, daddr, hnum, dif);
+ }
+ 
+ extern struct sock *inet6_lookup(struct inet_hashinfo *hashinfo,
+--- stblinux-2.6.18/net/core/sock.c	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/net/core/sock.c	2014-04-15 17:01:53.876635000 +0530
+@@ -386,6 +386,9 @@
+ 		case SO_REUSEADDR:
+ 			sk->sk_reuse = valbool;
+ 			break;
++      case SO_REUSEPORT:
++         sk->sk_reuseport = valbool;
++         break;
+ 		case SO_TYPE:
+ 		case SO_ERROR:
+ 			ret = -ENOPROTOOPT;
+@@ -682,6 +685,9 @@
+ 			v.val = sk->sk_reuse;
+ 			break;
+ 
++      case SO_REUSEPORT:
++         v.val = sk->sk_reuseport;
++         break;
+ 		case SO_KEEPALIVE:
+ 			v.val = !!sock_flag(sk, SOCK_KEEPOPEN);
+ 			break;
+--- stblinux-2.6.18/net/ipv4/inet_connection_sock.c	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/net/ipv4/inet_connection_sock.c	2014-04-15 17:53:30.472429000 +0530
+@@ -43,6 +43,8 @@
+ 	struct sock *sk2;
+ 	struct hlist_node *node;
+ 	int reuse = sk->sk_reuse;
++   int reuseport = sk->sk_reuseport;
++   uid_t uid =  sock_i_uid((struct sock *)sk);
+ 
+ 	sk_for_each_bound(sk2, node, &tb->owners) {
+ 		if (sk != sk2 &&
+@@ -50,8 +52,11 @@
+ 		    (!sk->sk_bound_dev_if ||
+ 		     !sk2->sk_bound_dev_if ||
+ 		     sk->sk_bound_dev_if == sk2->sk_bound_dev_if)) {
+-			if (!reuse || !sk2->sk_reuse ||
+-			    sk2->sk_state == TCP_LISTEN) {
++          if ((!reuse || !sk2->sk_reuse ||
++           sk2->sk_state == TCP_LISTEN) &&
++         (!reuseport || !sk2->sk_reuseport ||
++          (sk2->sk_state != TCP_TIME_WAIT &&
++             !(uid == sock_i_uid(sk2))))) {
+ 				const u32 sk2_rcv_saddr = inet_rcv_saddr(sk2);
+ 				if (!sk2_rcv_saddr || !sk_rcv_saddr ||
+ 				    sk2_rcv_saddr == sk_rcv_saddr)
+@@ -76,6 +81,7 @@
+ 	struct hlist_node *node;
+ 	struct inet_bind_bucket *tb;
+ 	int ret;
++   uid_t uid = sock_i_uid(sk);
+ 
+ 	local_bh_disable();
+ 	if (!snum) {
+@@ -124,8 +130,12 @@
+ 	if (!hlist_empty(&tb->owners)) {
+ 		if (sk->sk_reuse > 1)
+ 			goto success;
+-		if (tb->fastreuse > 0 &&
+-		    sk->sk_reuse && sk->sk_state != TCP_LISTEN) {
++     if (((tb->fastreuse > 0 &&
++                 sk->sk_reuse &&
++                sk->sk_state != TCP_LISTEN) ||
++              (tb->fastreuseport > 0 &&
++                sk->sk_reuseport &&
++               (tb->fastuid == uid)))) {
+ 			goto success;
+ 		} else {
+ 			ret = 1;
+@@ -142,9 +152,23 @@
+ 			tb->fastreuse = 1;
+ 		else
+ 			tb->fastreuse = 0;
+-	} else if (tb->fastreuse &&
++if (sk->sk_reuseport) {
++    tb->fastreuseport = 1;
++    tb->fastuid = uid;
++    } else {
++       tb->fastreuseport = 0;
++       tb->fastuid = 0;
++       }
++       } else {
++          if (tb->fastreuse &&
+ 		   (!sk->sk_reuse || sk->sk_state == TCP_LISTEN))
+ 		tb->fastreuse = 0;
++          if (tb->fastreuseport &&
++                (!sk->sk_reuseport || !(tb->fastuid == uid))) {
++             tb->fastreuseport = 0;
++             tb->fastuid = 0;
++             }
++             }
+ success:
+ 	if (!inet_csk(sk)->icsk_bind_hash)
+ 		inet_bind_hash(sk, tb, snum);
+--- stblinux-2.6.18/net/ipv4/inet_hashtables.c	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/net/ipv4/inet_hashtables.c	2014-04-15 17:59:02.297409000 +0530
+@@ -36,6 +36,7 @@
+ 	if (tb != NULL) {
+ 		tb->port      = snum;
+ 		tb->fastreuse = 0;
++      tb->fastreuseport = 0;
+ 		INIT_HLIST_HEAD(&tb->owners);
+ 		hlist_add_head(&tb->node, &head->chain);
+ 	}
+@@ -124,35 +125,48 @@
+  * remote address for the connection. So always assume those are both
+  * wildcarded during the search since they can never be otherwise.
+  */
+-struct sock *__inet_lookup_listener(const struct hlist_head *head, const u32 daddr,
++struct sock *__inet_lookup_listener(const struct hlist_head *head, const u32 saddr, u16 sport,const u32 daddr,
+ 				    const unsigned short hnum, const int dif)
+ {
+ 	struct sock *result = NULL, *sk;
+ 	const struct hlist_node *node;
+-	int hiscore = -1;
++   int hiscore, matches = 0, reuseport = 0;
++    u32 phash = 0;
++    hiscore = 0;
+ 
+ 	sk_for_each(sk, node, head) {
+ 		const struct inet_sock *inet = inet_sk(sk);
+ 
+ 		if (inet->num == hnum && !ipv6_only_sock(sk)) {
+ 			const __u32 rcv_saddr = inet->rcv_saddr;
+-			int score = sk->sk_family == PF_INET ? 1 : 0;
++			int score = sk->sk_family == PF_INET ? 2 : 1;
+ 
+ 			if (rcv_saddr) {
+ 				if (rcv_saddr != daddr)
+ 					continue;
+-				score += 2;
++				score += 4;
+ 			}
+ 			if (sk->sk_bound_dev_if) {
+ 				if (sk->sk_bound_dev_if != dif)
+ 					continue;
+-				score += 2;
++				score += 4;
+ 			}
+ 			if (score == 5)
+ 				return sk;
+ 			if (score > hiscore) {
+ 				hiscore	= score;
+ 				result	= sk;
++ reuseport = sk->sk_reuseport;
++ if (reuseport) {
++    phash = inet_ehashfn(daddr, hnum, saddr, sport);
++    matches = 1;
++    }
++    } else if (score == hiscore && reuseport) {
++       matches++;
++       if (((u64)phash * matches) >> 32 == 0)
++          result = sk;
++       //phash = next_pseudo_random32(phash);
++	phash = phash * 1664525 + 1013904223;
+ 			}
+ 		}
+ 	}
+@@ -273,7 +287,7 @@
+ 			inet_bind_bucket_for_each(tb, node, &head->chain) {
+  				if (tb->port == port) {
+  					BUG_TRAP(!hlist_empty(&tb->owners));
+- 					if (tb->fastreuse >= 0)
++ 					if (tb->fastreuse >= 0 || tb->fastreuseport >= 0)
+  						goto next_port;
+  					if (!__inet_check_established(death_row,
+ 								      sk, port,
+@@ -289,6 +303,7 @@
+  				break;
+  			}
+  			tb->fastreuse = -1;
++ 			tb->fastreuse = -1;
+  			goto ok;
+ 
+  		next_port:
+--- stblinux-2.6.18/net/ipv4/tcp_ipv4.c	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/net/ipv4/tcp_ipv4.c	2014-04-15 17:01:05.873183000 +0530
+@@ -1164,6 +1164,8 @@
+ 					   skb, th)) {
+ 	case TCP_TW_SYN: {
+ 		struct sock *sk2 = inet_lookup_listener(&tcp_hashinfo,
++                     skb->nh.iph->saddr,
++                     th->source,
+ 							skb->nh.iph->daddr,
+ 							ntohs(th->dest),
+ 							inet_iif(skb));
+--- stblinux-2.6.18/net/ipv4/udp.c	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/net/ipv4/udp.c	2014-04-15 17:58:21.923728000 +0530
+@@ -126,6 +126,7 @@
+ 	struct hlist_node *node;
+ 	struct sock *sk2;
+ 	struct inet_sock *inet = inet_sk(sk);
++   uid_t uid = sock_i_uid(sk);
+ 
+ 	write_lock_bh(&udp_hash_lock);
+ 	if (snum == 0) {
+@@ -183,7 +184,9 @@
+ 			    (!inet2->rcv_saddr ||
+ 			     !inet->rcv_saddr ||
+ 			     inet2->rcv_saddr == inet->rcv_saddr) &&
+-			    (!sk2->sk_reuse || !sk->sk_reuse))
++			    (!sk2->sk_reuse || !sk->sk_reuse) && 
++              (!sk2->sk_reuseport || !sk->sk_reuseport || !(uid ==  sock_i_uid(sk2))) 
++             )
+ 				goto fail;
+ 		}
+ 	}
+@@ -226,32 +229,34 @@
+ 	struct sock *sk, *result = NULL;
+ 	struct hlist_node *node;
+ 	unsigned short hnum = ntohs(dport);
+-	int badness = -1;
++	int badness = 0;
+ 
++   int matches = 0, reuseport = 0;
++    u32 hash = 0;
+ 	sk_for_each(sk, node, &udp_hash[hnum & (UDP_HTABLE_SIZE - 1)]) {
+ 		struct inet_sock *inet = inet_sk(sk);
+ 
+ 		if (inet->num == hnum && !ipv6_only_sock(sk)) {
+-			int score = (sk->sk_family == PF_INET ? 1 : 0);
++			int score = (sk->sk_family == PF_INET ? 2 : 1);
+ 			if (inet->rcv_saddr) {
+ 				if (inet->rcv_saddr != daddr)
+ 					continue;
+-				score+=2;
++				score+=4;
+ 			}
+ 			if (inet->daddr) {
+ 				if (inet->daddr != saddr)
+ 					continue;
+-				score+=2;
++				score+=4;
+ 			}
+ 			if (inet->dport) {
+ 				if (inet->dport != sport)
+ 					continue;
+-				score+=2;
++				score+=4;
+ 			}
+ 			if (sk->sk_bound_dev_if) {
+ 				if (sk->sk_bound_dev_if != dif)
+ 					continue;
+-				score+=2;
++				score+=4;
+ 			}
+ 			if(score == 9) {
+ 				result = sk;
+@@ -259,6 +264,30 @@
+ 			} else if(score > badness) {
+ 				result = sk;
+ 				badness = score;
++            reuseport = sk->sk_reuseport;
++             if (reuseport) {
++                hash = inet_ehashfn(daddr, hnum, saddr, htons(sport));
++                matches = 1;
++                }
++                } else if (score == badness && reuseport) {
++                   matches++;
++                   if (((u64)hash * matches) >> 32 == 0) {
++                     result = sk;
++                     //hash = next_pseudo_random32(hash);
++		     hash = hash * 1664525 + 1013904223;
++                     reuseport = sk->sk_reuseport;
++		   }
++                   if (reuseport) {
++                      hash = inet_ehashfn(daddr, hnum,
++                            saddr, htons(sport));
++                      matches = 1;
++                      }
++                      } else if (score == badness && reuseport) {
++                         matches++;
++                         if (((u64)hash * matches) >> 32 == 0)
++                         result = sk;
++                         //hash = next_pseudo_random32(hash);
++ 			 hash = hash * 1664525 + 1013904223;
+ 			}
+ 		}
+ 	}
+--- stblinux-2.6.18/net/ipv6/inet6_connection_sock.c	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/net/ipv6/inet6_connection_sock.c	2014-04-15 17:52:03.951382000 +0530
+@@ -31,17 +31,25 @@
+ {
+ 	const struct sock *sk2;
+ 	const struct hlist_node *node;
++  int reuse = sk->sk_reuse;
++  int reuseport = sk->sk_reuseport;
++  int uid = sock_i_uid((struct sock *)sk);
+ 
+ 	/* We must walk the whole port owner list in this case. -DaveM */
+ 	sk_for_each_bound(sk2, node, &tb->owners) {
+ 		if (sk != sk2 &&
+ 		    (!sk->sk_bound_dev_if ||
+ 		     !sk2->sk_bound_dev_if ||
+-		     sk->sk_bound_dev_if == sk2->sk_bound_dev_if) &&
+-		    (!sk->sk_reuse || !sk2->sk_reuse ||
++ sk->sk_bound_dev_if == sk2->sk_bound_dev_if)) {
++    if ((!reuse || !sk2->sk_reuse ||
+ 		     sk2->sk_state == TCP_LISTEN) &&
+-		     ipv6_rcv_saddr_equal(sk, sk2))
++          (!reuseport || !sk2->sk_reuseport ||
++             (sk2->sk_state != TCP_TIME_WAIT &&
++                !(uid == sock_i_uid((struct sock *)sk2))))) {
++       if (ipv6_rcv_saddr_equal(sk, sk2))
+ 			break;
++       }
++       }
+ 	}
+ 
+ 	return node != NULL;
+--- stblinux-2.6.18/net/ipv6/inet6_hashtables.c	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/net/ipv6/inet6_hashtables.c	2014-04-15 17:57:11.806748000 +0530
+@@ -103,14 +103,18 @@
+ EXPORT_SYMBOL(__inet6_lookup_established);
+ 
+ struct sock *inet6_lookup_listener(struct inet_hashinfo *hashinfo,
++               const struct in6_addr *saddr,
++               const u16 sport,
+ 				   const struct in6_addr *daddr,
+ 				   const unsigned short hnum, const int dif)
+ {
+ 	struct sock *sk;
+ 	const struct hlist_node *node;
+ 	struct sock *result = NULL;
+-	int score, hiscore = 0;
++ int score, hiscore, matches = 0, reuseport = 0;
++ u32 phash = 0;
+ 
++   hiscore = 0;
+ 	read_lock(&hashinfo->lhash_lock);
+ 	sk_for_each(sk, node, &hashinfo->listening_hash[inet_lhashfn(hnum)]) {
+ 		if (inet_sk(sk)->num == hnum && sk->sk_family == PF_INET6) {
+@@ -134,6 +138,18 @@
+ 			if (score > hiscore) {
+ 				hiscore = score;
+ 				result = sk;
++ reuseport = sk->sk_reuseport;
++ if (reuseport) {
++    phash = inet6_ehashfn(net, daddr, hnum,
++          saddr, sport);
++    matches = 1;
++    }
++    } else if (score == hiscore && reuseport) {
++       matches++;
++       if (((u64)phash * matches) >> 32 == 0)
++          result = sk;
++      // phash = next_pseudo_random32(phash);
++	phash = phash * 1664525 + 1013904223;
+ 			}
+ 		}
+ 	}
+--- stblinux-2.6.18/net/ipv6/tcp_ipv6.c	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/net/ipv6/tcp_ipv6.c	2014-04-15 17:00:12.636231000 +0530
+@@ -1291,7 +1291,7 @@
+ 		struct sock *sk2;
+ 
+ 		sk2 = inet6_lookup_listener(&tcp_hashinfo,
+-					    &skb->nh.ipv6h->daddr,
++					    &skb->nh.ipv6h->saddr, th->source, &skb->nh.ipv6h->daddr,
+ 					    ntohs(th->dest), inet6_iif(skb));
+ 		if (sk2 != NULL) {
+ 			struct inet_timewait_sock *tw = inet_twsk(sk);
+--- stblinux-2.6.18/net/ipv6/udp.c	2007-03-10 17:35:57.000000000 +0530
++++ Linux_Kernel/net/ipv6/udp.c	2014-04-15 17:56:30.118126000 +0530
+@@ -55,6 +55,7 @@
+ 
+ #include <net/ip6_checksum.h>
+ #include <net/xfrm.h>
++#include <net/inet6_hashtables.h>
+ 
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+@@ -159,7 +160,8 @@
+ 	struct sock *sk, *result = NULL;
+ 	struct hlist_node *node;
+ 	unsigned short hnum = ntohs(dport);
+-	int badness = -1;
++int badness, matches = 0, reuseport = 0;
++ u32 hash = 0;
+ 
+  	read_lock(&udp_hash_lock);
+ 	sk_for_each(sk, node, &udp_hash[hnum & (UDP_HTABLE_SIZE - 1)]) {
+@@ -194,6 +196,18 @@
+ 			} else if(score > badness) {
+ 				result = sk;
+ 				badness = score;
++       reuseport = sk->sk_reuseport;
++        if (reuseport) {
++           hash = inet6_ehashfn(daddr, hnum,
++                 saddr, sport);
++          matches = 1;
++           }
++           } else if (score == badness && reuseport) {
++              matches++;
++              if (((u64)hash * matches) >> 32 == 0)
++                 result = sk;
++		 hash = hash * 1664525 + 1013904223;
++		 hash = hash * 1664525 + 1013904223;
+ 			}
+ 		}
+ 	}
