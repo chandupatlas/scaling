@@ -22,5 +22,4 @@ http://lwn.net/Articles/542629/
 
 http://domsch.com/linux/lpc2010/Scaling_techniques_for_servers_with_high_connection%20rates.pdf
 
-Thanks
-Chris (srinivas.chandupatla@gmail.com)
+
